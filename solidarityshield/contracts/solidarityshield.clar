@@ -7,6 +7,10 @@
 (define-constant err-insufficient-contribution (err u101))
 (define-constant err-claim-limit-exceeded (err u103))
 (define-constant err-oracle-validation-failed (err u201))
+(define-constant err-invalid-claim-type (err u202))
+(define-constant err-invalid-severity (err u203))
+(define-constant err-invalid-evidence (err u204))
+(define-constant err-invalid-claim-id (err u205))
 
 ;; Contract Constants
 (define-constant contract-owner tx-sender)
@@ -122,6 +126,9 @@
 )
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (> (len claim-type) u0) err-invalid-claim-type)
+    (asserts! (<= min-severity max-severity) err-invalid-severity)
+    (asserts! (is-eq (len required-evidence) u3) err-invalid-evidence)
     
     (map-set claim-parameters 
       {claim-type: claim-type}
@@ -155,11 +162,12 @@
       ))
       
       ;; Validate claim with oracle
-      (oracle-result (try! 
+      (oracle-result (unwrap! 
         (contract-call? oracle-contract validate-claim 
           claim-type 
           claim-evidence
         )
+        err-oracle-validation-failed
       ))
       
       ;; Current claim ID
@@ -206,7 +214,7 @@
   (let 
     (
       (member (unwrap! (map-get? members {member: tx-sender}) err-not-registered))
-      (current-claim (unwrap! (map-get? claims {claim-id: claim-id}) err-not-registered))
+      (current-claim (unwrap! (map-get? claims {claim-id: claim-id}) err-invalid-claim-id))
     )
     ;; Check voting deadline
     (asserts! (< block-height (get voting-deadline current-claim)) err-not-authorized)
@@ -234,14 +242,14 @@
 (define-private (resolve-claim (claim-id uint))
   (let 
     (
-      (current-claim (unwrap! (map-get? claims {claim-id: claim-id}) err-not-registered))
+      (current-claim (unwrap! (map-get? claims {claim-id: claim-id}) err-invalid-claim-id))
       (total-votes (+ (get yes-votes current-claim) (get no-votes current-claim)))
       (approval-percentage 
         (if (> total-votes u0)
             (/ (* (get yes-votes current-claim) u100) total-votes)
             u0
         )
-    )
+      )
     )
     ;; Check if claim meets approval threshold
     (if (>= approval-percentage claim-approval-threshold)
