@@ -1,20 +1,49 @@
 ;; SolidarityShield: Decentralized Mutual Insurance Platform
 ;; SPDX-License-Identifier: MIT
 
+;; Error Constants
+(define-constant err-not-authorized (err u300))
+(define-constant err-not-registered (err u100))
+(define-constant err-insufficient-contribution (err u101))
+(define-constant err-claim-limit-exceeded (err u103))
+(define-constant err-oracle-validation-failed (err u201))
+
+;; Contract Constants
 (define-constant contract-owner tx-sender)
 (define-constant min-contribution u10000000) ;; 0.1 STX
 (define-constant voting-period u604800) ;; 7 days in seconds
 (define-constant claim-approval-threshold u66) ;; 66% approval required
 
-;; Error constants
-(define-constant err-not-registered (err u100))
-(define-constant err-already-registered (err u101))
-(define-constant err-insufficient-contribution (err u102))
-(define-constant err-claim-limit-exceeded (err u103))
-(define-constant err-voting-ended (err u104))
-(define-constant err-already-voted (err u105))
+;; Claim Type Definitions
+(define-map claim-parameters
+  {claim-type: (string-ascii 50)}
+  {
+    min-severity: uint,
+    max-severity: uint,
+    required-evidence: (list 3 (string-ascii 50))
+  }
+)
 
-;; Store member information
+;; Oracle Trait Definition
+(define-trait oracle-trait
+  (
+    (validate-claim 
+      (
+        (string-ascii 50)  ;; claim type
+        (list 10 (string-ascii 100))  ;; claim evidence
+      ) 
+      (response 
+        {
+          verified: bool, 
+          confidence: uint
+        } 
+        uint
+      )
+    )
+  )
+)
+
+;; Member Tracking
 (define-map members 
   {member: principal}
   {
@@ -24,37 +53,41 @@
   }
 )
 
-;; Claim status enum (using integers)
+;; Claim Status Enum
 (define-constant claim-status-pending u0)
-(define-constant claim-status-approved u1)
-(define-constant claim-status-rejected u2)
+(define-constant claim-status-oracle-verified u1)
+(define-constant claim-status-approved u2)
+(define-constant claim-status-rejected u3)
 
-;; Store claim information
+;; Claims Tracking
 (define-map claims 
   {claim-id: uint}
   {
     claimant: principal,
     amount: uint,
+    claim-type: (string-ascii 50),
     status: uint,
+    oracle-confidence: uint,
     voting-deadline: uint,
     yes-votes: uint,
-    no-votes: uint
+    no-votes: uint,
+    claim-evidence: (list 10 (string-ascii 100))
   }
 )
 
-;; Track total pool funds and claim counter
+;; Global State Variables
 (define-data-var total-pool-funds uint u0)
 (define-data-var member-count uint u0)
 (define-data-var claim-counter uint u0)
 
-;; Member registration
+;; Member Registration
 (define-public (register-member)
   (let 
     (
       (contribution (stx-get-balance tx-sender))
     )
     ;; Check if member is already registered
-    (asserts! (is-none (map-get? members {member: tx-sender})) err-already-registered)
+    (asserts! (is-none (map-get? members {member: tx-sender})) err-not-registered)
     
     ;; Check minimum contribution
     (asserts! (>= contribution min-contribution) err-insufficient-contribution)
@@ -80,13 +113,68 @@
   )
 )
 
-;; Submit a claim
-(define-public (submit-claim (claim-amount uint))
+;; Add Claim Parameters (Governance Function)
+(define-public (add-claim-parameters 
+  (claim-type (string-ascii 50))
+  (min-severity uint)
+  (max-severity uint)
+  (required-evidence (list 3 (string-ascii 50)))
+)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    
+    (map-set claim-parameters 
+      {claim-type: claim-type}
+      {
+        min-severity: min-severity,
+        max-severity: max-severity,
+        required-evidence: required-evidence
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Submit a Claim with Oracle Validation
+(define-public (submit-claim 
+  (claim-amount uint)
+  (claim-type (string-ascii 50))
+  (claim-evidence (list 10 (string-ascii 100)))
+  (oracle-contract <oracle-trait>)
+)
   (let 
     (
+      ;; Verify member is registered
       (member (unwrap! (map-get? members {member: tx-sender}) err-not-registered))
+      
+      ;; Get claim parameters
+      (claim-params (unwrap! 
+        (map-get? claim-parameters {claim-type: claim-type}) 
+        err-not-authorized
+      ))
+      
+      ;; Validate claim with oracle
+      (oracle-result (try! 
+        (contract-call? oracle-contract validate-claim 
+          claim-type 
+          claim-evidence
+        )
+      ))
+      
+      ;; Current claim ID
       (current-claim-id (var-get claim-counter))
     )
+    ;; Validate oracle response
+    (asserts! 
+      (and
+        (get verified oracle-result)
+        (>= (get confidence oracle-result) (get min-severity claim-params))
+        (<= (get confidence oracle-result) (get max-severity claim-params))
+      )
+      err-oracle-validation-failed
+    )
+    
     ;; Ensure claim is within pool limits
     (asserts! (<= claim-amount (/ (var-get total-pool-funds) u2)) err-claim-limit-exceeded)
     
@@ -96,10 +184,13 @@
       {
         claimant: tx-sender,
         amount: claim-amount,
-        status: claim-status-pending,
+        claim-type: claim-type,
+        status: claim-status-oracle-verified,
+        oracle-confidence: (get confidence oracle-result),
         voting-deadline: (+ block-height voting-period),
         yes-votes: u0,
-        no-votes: u0
+        no-votes: u0,
+        claim-evidence: claim-evidence
       }
     )
     
@@ -110,7 +201,7 @@
   )
 )
 
-;; Vote on a claim
+;; Vote on a Claim
 (define-public (vote-claim (claim-id uint) (vote bool))
   (let 
     (
@@ -118,7 +209,7 @@
       (current-claim (unwrap! (map-get? claims {claim-id: claim-id}) err-not-registered))
     )
     ;; Check voting deadline
-    (asserts! (< block-height (get voting-deadline current-claim)) err-voting-ended)
+    (asserts! (< block-height (get voting-deadline current-claim)) err-not-authorized)
     
     ;; Update votes based on vote
     (if vote 
@@ -139,7 +230,7 @@
   )
 )
 
-;; Resolve claim based on voting results
+;; Internal Claim Resolution
 (define-private (resolve-claim (claim-id uint))
   (let 
     (
@@ -179,7 +270,7 @@
   )
 )
 
-;; Read-only functions to get contract information
+;; Read-only Functions for Transparency
 (define-read-only (get-total-pool-funds)
   (var-get total-pool-funds)
 )
@@ -190,4 +281,8 @@
 
 (define-read-only (get-claim-info (claim-id uint))
   (map-get? claims {claim-id: claim-id})
+)
+
+(define-read-only (get-claim-parameters (claim-type (string-ascii 50)))
+  (map-get? claim-parameters {claim-type: claim-type})
 )
